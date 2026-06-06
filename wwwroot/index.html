@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ToolBelt — Local AI Assistant</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 h-screen flex flex-col">
+
+  <!-- Error banner -->
+  <div id="error-banner" class="hidden bg-red-800 text-white text-sm px-4 py-2 text-center"></div>
+
+  <!-- Header -->
+  <header class="bg-gray-900 border-b border-gray-800 px-4 py-3 flex items-center gap-2">
+    <span class="text-xl">🔧</span>
+    <span class="font-semibold text-gray-100 text-lg">ToolBelt</span>
+    <span class="text-xs text-gray-500 ml-2">Powered by llama3.2:3b via Ollama</span>
+  </header>
+
+  <!-- Chat area -->
+  <main id="chat" class="flex-1 overflow-y-auto px-4 py-4 space-y-4"></main>
+
+  <!-- Input area -->
+  <footer class="bg-gray-900 border-t border-gray-800 px-4 py-3 flex gap-2">
+    <input
+      id="input"
+      type="text"
+      placeholder="Ask anything — try 'what is 23 * 19?' or 'remember I parked on level 3'"
+      class="flex-1 bg-gray-800 text-gray-100 placeholder-gray-500 rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+    />
+    <button
+      id="send-btn"
+      class="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm font-medium px-5 py-2 rounded-lg transition-colors"
+    >
+      Send
+    </button>
+  </footer>
+
+  <script>
+    const chat = document.getElementById('chat');
+    const input = document.getElementById('input');
+    const sendBtn = document.getElementById('send-btn');
+    const errorBanner = document.getElementById('error-banner');
+
+    let sessionId = null;
+    let streaming = false;
+
+    // ---------- session bootstrap ----------
+    async function ensureSession() {
+      if (sessionId) return;
+      const res = await fetch('/api/session', { method: 'POST' });
+      const data = await res.json();
+      sessionId = data.sessionId;
+    }
+
+    // ---------- message rendering ----------
+    function appendUserBubble(text) {
+      const div = document.createElement('div');
+      div.className = 'flex justify-end';
+      div.innerHTML = `
+        <div class="max-w-[75%] bg-indigo-700 rounded-2xl rounded-br-sm px-4 py-2 text-sm whitespace-pre-wrap">${escHtml(text)}</div>
+      `;
+      chat.appendChild(div);
+      scrollToBottom();
+      return div;
+    }
+
+    function appendAssistantBubble() {
+      const wrapper = document.createElement('div');
+      wrapper.className = 'flex justify-start';
+      const bubble = document.createElement('div');
+      bubble.className = 'max-w-[75%] bg-gray-800 rounded-2xl rounded-bl-sm px-4 py-2 text-sm space-y-2';
+      wrapper.appendChild(bubble);
+      chat.appendChild(wrapper);
+      scrollToBottom();
+      return bubble;
+    }
+
+    function appendToolChip(bubble, name, args, result) {
+      const chip = document.createElement('div');
+      chip.className = 'flex items-start gap-2 bg-gray-700 rounded-lg px-3 py-1.5 text-xs font-mono text-gray-300';
+      const argsStr = formatArgs(args);
+      chip.innerHTML = `
+        <span class="text-yellow-400 shrink-0">🔧</span>
+        <span class="break-all"><span class="text-gray-100">${escHtml(name)}</span>(${escHtml(argsStr)}) → ${escHtml(result ?? '…')}</span>
+      `;
+      bubble.appendChild(chip);
+      scrollToBottom();
+      return chip;
+    }
+
+    function formatArgs(args) {
+      if (!args) return '';
+      try { return JSON.stringify(args); }
+      catch { return String(args); }
+    }
+
+    // ---------- streaming ----------
+    async function sendMessage() {
+      const text = input.value.trim();
+      if (!text || streaming) return;
+
+      hideError();
+      input.value = '';
+      setStreaming(true);
+
+      appendUserBubble(text);
+      const bubble = appendAssistantBubble();
+
+      // Text node that grows as tokens arrive
+      const textNode = document.createTextNode('');
+      bubble.appendChild(textNode);
+
+      // Pending tool chip — tool_call arrives before tool_result
+      const pendingChips = {};
+
+      try {
+        await ensureSession();
+
+        const res = await fetch('/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sessionId, message: text })
+        });
+
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+        await readSseStream(res, (event) => {
+          if (event.type === 'token') {
+            textNode.textContent += event.text;
+            scrollToBottom();
+          } else if (event.type === 'tool_call') {
+            const chip = appendToolChip(bubble, event.name, event.args, null);
+            pendingChips[event.name] = chip;
+          } else if (event.type === 'tool_result') {
+            const chip = pendingChips[event.name];
+            if (chip) {
+              // Update the existing chip to include the result
+              const spanEl = chip.querySelector('span:last-child');
+              if (spanEl) {
+                const argsStr = formatArgs(null);
+                // Re-render to fill in result
+                const argsSpan = spanEl.querySelector('span');
+                const toolName = argsSpan ? argsSpan.textContent : event.name;
+                spanEl.innerHTML = `<span class="text-gray-100">${escHtml(toolName)}</span> → ${escHtml(event.result)}`;
+              }
+              delete pendingChips[event.name];
+            } else {
+              appendToolChip(bubble, event.name, null, event.result);
+            }
+          } else if (event.type === 'error') {
+            showError(event.message);
+          } else if (event.type === 'done') {
+            // Stream finished — nothing to do
+          }
+        });
+      } catch (err) {
+        showError(`Connection error: ${err.message}`);
+      } finally {
+        setStreaming(false);
+        if (!textNode.textContent && bubble.children.length === 0) {
+          bubble.textContent = '(no response)';
+        }
+      }
+    }
+
+    // Reads a fetch response body as SSE frames ("data: {...}\n\n")
+    async function readSseStream(response, onEvent) {
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        const frames = buffer.split('\n\n');
+        buffer = frames.pop() ?? '';
+
+        for (const frame of frames) {
+          const dataLine = frame.split('\n').find(l => l.startsWith('data: '));
+          if (!dataLine) continue;
+          const json = dataLine.slice(6);
+          try { onEvent(JSON.parse(json)); } catch { /* skip malformed */ }
+        }
+      }
+    }
+
+    // ---------- helpers ----------
+    function setStreaming(on) {
+      streaming = on;
+      input.disabled = on;
+      sendBtn.disabled = on;
+    }
+
+    function scrollToBottom() {
+      chat.scrollTop = chat.scrollHeight;
+    }
+
+    function showError(msg) {
+      errorBanner.textContent = msg;
+      errorBanner.classList.remove('hidden');
+    }
+
+    function hideError() {
+      errorBanner.classList.add('hidden');
+    }
+
+    function escHtml(str) {
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    // ---------- event wiring ----------
+    sendBtn.addEventListener('click', sendMessage);
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') sendMessage(); });
+  </script>
+</body>
+</html>
